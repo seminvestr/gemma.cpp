@@ -1640,12 +1640,33 @@ void RMSNormBatched(size_t num_tokens, const float* activations,
   }
 }
 
+// RMSNorm without scale parameters.
+template <size_t kBatchSize, typename OutT>
+static void RMSNormNoScaleBatched(size_t num_tokens, const float* activations,
+                                  OutT* out, const size_t model_dim) {
+  HWY_DASSERT(num_tokens <= kBatchSize);
+  for (size_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
+    RMSNormNoScale(activations + token_idx * model_dim,
+                   out + token_idx * model_dim, model_dim);
+  }
+}
+
 template <size_t kBatchSize, typename WeightT, typename InOutT>
 void RMSNormInplaceBatched(size_t num_tokens, const WeightT* weights,
                            InOutT* inout, const size_t model_dim) {
   HWY_DASSERT(num_tokens <= kBatchSize);
   for (size_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
     RMSNormInplace(weights, inout + token_idx * model_dim, model_dim);
+  }
+}
+
+// RMSNormInplace without scale parameters.
+template <size_t kBatchSize, typename InOutT>
+void RMSNormNoScaleInplaceBatched(size_t num_tokens, InOutT* inout,
+                                  const size_t model_dim) {
+  HWY_DASSERT(num_tokens <= kBatchSize);
+  for (size_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
+    RMSNormNoScaleInplace(inout + token_idx * model_dim, model_dim);
   }
 }
 
@@ -1656,6 +1677,89 @@ void AddFromBatched(size_t num_tokens, const float* other, float* x,
   for (size_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
     AddFrom(other + token_idx * model_dim, x + token_idx * model_dim,
             model_dim);
+  }
+}
+
+// Sigmoid based gated residual connection.
+// x = sqrt(1-sigmoid(gamma)^2) * x + sigmoid(gamma) * other.
+// WeightT: float
+static HWY_NOINLINE HWY_MAYBE_UNUSED void GatedResidualConnection(
+    const float* HWY_RESTRICT gamma, const float* HWY_RESTRICT other,
+    float* HWY_RESTRICT x, const size_t size) {
+  namespace hn = hwy::HWY_NAMESPACE;
+  const hn::ScalableTag<float> d;
+
+  const auto v_one = hn::Set(d, 1.0f);
+  const size_t N = hn::Lanes(d);
+
+  HWY_DASSERT(size % MaxLanes(d) == 0);
+  for (size_t i = 0; i < size; i += N) {
+    const auto gamma0 = hn::LoadU(d, gamma + i);
+    // sigmoid(gamma)
+    // TODO[kanwu] Can/should we use approximate sigmoid?
+    const auto sigmoid0 =
+        hn::Div(v_one, hn::Add(v_one, hn::Exp(d, hn::Neg(gamma0))));
+    // sqrt(1-sigmoid(gamma)^2)
+    const auto pre_factor0 = hn::NegMulAdd(sigmoid0, sigmoid0, v_one);
+    // pre_result = pre_factor * x
+    const auto pre_result0 = hn::Mul(pre_factor0, hn::LoadU(d, x + i));
+    // pre_result + sigmoid * other
+    hn::StoreU(hn::MulAdd(sigmoid0, hn::LoadU(d, other + i), pre_result0), d,
+               x + i);
+  }
+}
+
+// WeightT: bf16
+static HWY_NOINLINE HWY_MAYBE_UNUSED void GatedResidualConnection(
+    const hwy::bfloat16_t* HWY_RESTRICT gamma, const float* HWY_RESTRICT other,
+    float* HWY_RESTRICT x, const size_t size) {
+
+  namespace hn = hwy::HWY_NAMESPACE;
+  const hn::ScalableTag<float> d;
+  const hn::ScalableTag<hwy::bfloat16_t> dbf;
+  const hn::Repartition<float, decltype(dbf)> df32;
+  const size_t N32 = hn::Lanes(df32);
+
+  const auto v_one = hn::Set(d, 1.0f);
+  HWY_DASSERT(size % (2 * MaxLanes(df32)) == 0);
+  for (size_t i = 0; i < size; i += 2 * N32) {
+    const hn::Vec<decltype(dbf)> gemma16 = hn::LoadU(dbf, gamma + i);
+    const auto gamma0 = hn::PromoteLowerTo(df32, gemma16);
+    const auto gamma1 = hn::PromoteUpperTo(df32, gemma16);
+
+    // sigmoid(gamma)
+    // TODO[kanwu] Can/should we use approximate sigmoid?
+    const auto sigmoid0 =
+        hn::Div(v_one, hn::Add(v_one, hn::Exp(df32, hn::Neg(gamma0))));
+    const auto sigmoid1 =
+        hn::Div(v_one, hn::Add(v_one, hn::Exp(df32, hn::Neg(gamma1))));
+
+    // sqrt(1-sigmoid(gamma)^2)
+    const auto pre_factor0 = hn::NegMulAdd(sigmoid0, sigmoid0, v_one);
+    const auto pre_factor1 = hn::NegMulAdd(sigmoid1, sigmoid1, v_one);
+
+    // pre_result = pre_factor * x
+    const auto pre_result0 = hn::Mul(pre_factor0, hn::LoadU(df32, x + i));
+    const auto pre_result1 = hn::Mul(pre_factor1, hn::LoadU(df32, x + i + N32));
+
+    // pre_result + sigmoid * other
+    hn::StoreU(hn::MulAdd(sigmoid0, hn::LoadU(df32, other + i), pre_result0),
+               df32, x + i);
+    hn::StoreU(
+        hn::MulAdd(sigmoid1, hn::LoadU(df32, other + i + N32), pre_result1),
+        df32, x + i + N32);
+  }
+}
+
+// Sigmoid based gated residual connection. WeightT: bf16
+template <size_t kBatchSize, typename WeightT>
+void GatedResidualConnectionBatched(size_t num_tokens, const WeightT* gamma,
+                                    const float* other, float* x,
+                                    const size_t model_dim) {
+  HWY_DASSERT(num_tokens <= kBatchSize);
+  for (size_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
+    GatedResidualConnection(gamma, other + token_idx * model_dim,
+                            x + token_idx * model_dim, model_dim);
   }
 }
 
