@@ -26,6 +26,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "compression/compress-inl.h"
 #include "compression/compress.h"
 #include "compression/shared.h"
 #include "gemma/common.h"
@@ -33,6 +34,7 @@
 #include "hwy/aligned_allocator.h"
 #include "hwy/base.h"
 #include "hwy/contrib/thread_pool/thread_pool.h"
+#include "hwy/highway.h"
 
 namespace gcpp {
 
@@ -218,6 +220,41 @@ struct LayerWeightsPtrs {
       storage->Allocate();
       att_weights.SetPtr(*storage);
     }
+
+    if (hwy::IsSame<Weight, NuqStream>()) {
+      namespace hn = hwy::HWY_NAMESPACE;
+      const hn::ScalableTag<float> df;
+
+      hwy::AlignedFreeUniquePtr<float[]> attn_vec_einsum_w_tmp =
+          hwy::AllocateAligned<float>(model_dim * heads * qkv_dim);
+      hwy::AlignedFreeUniquePtr<float[]> att_weights_tmp =
+          hwy::AllocateAligned<float>(model_dim * heads * qkv_dim);
+
+      HWY_NAMESPACE::DecompressAndZeroPad(
+          df, MakeSpan(attn_vec_einsum_w.data(), model_dim * heads * qkv_dim),
+          0, attn_vec_einsum_w_tmp.get(), model_dim * heads * qkv_dim);
+
+      for (size_t m = 0; m < model_dim; ++m) {
+        float* HWY_RESTRICT out_row =
+            att_weights_tmp.get() + m * heads * qkv_dim;
+        for (size_t h = 0; h < heads; ++h) {
+          hwy::CopyBytes(attn_vec_einsum_w_tmp.get() + h * model_dim * qkv_dim +
+                             m * qkv_dim,
+                         out_row + h * qkv_dim, qkv_dim * sizeof(float));
+        }
+      }
+
+      CompressWorkingSet work;
+      hwy::ThreadPool pool(0);
+
+      HWY_NAMESPACE::Compress(
+          att_weights_tmp.get(), model_dim * heads * qkv_dim, work,
+          MakeSpan(att_weights.data(), model_dim * heads * qkv_dim),
+          /*packed_ofs=*/0, pool);
+
+      return;
+    }
+
     for (size_t m = 0; m < model_dim; ++m) {
       Weight* HWY_RESTRICT out_row = att_weights.data() + m * heads * qkv_dim;
       for (size_t h = 0; h < heads; ++h) {
